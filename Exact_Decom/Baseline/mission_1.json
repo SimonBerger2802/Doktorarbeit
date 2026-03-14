@@ -1,0 +1,22 @@
+{
+  "agent": 1,
+  "depot_index": 1,
+  "depot_point": [
+    70.0,
+    50.0
+  ],
+  "tour_node_indices": [
+    1,
+    1
+  ],
+  "tour_points": [
+    [
+      70.0,
+      50.0
+    ],
+    [
+      70.0,
+      50.0
+    ]
+  ]
+}
