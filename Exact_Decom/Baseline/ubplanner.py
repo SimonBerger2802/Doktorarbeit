@@ -100,7 +100,7 @@ class UBPlanner:
         for agent in range(len(self.m_agents)):
             agent_start = time.perf_counter()
 
-            if not self.plan_agent(agent):#self.plan_agent_quadratic(agent):
+            if not self.plan_agent_quadratic(agent): #-self.plan_agent(agent):
                 raise RuntimeError(f"Unable to plan the coverage path for agent: {agent}")
 
             if not self.validate_path(agent):
