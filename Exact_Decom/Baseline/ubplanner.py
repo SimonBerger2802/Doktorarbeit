@@ -6,6 +6,7 @@ from typing import List, Optional, Tuple
 import json
 import time
 
+from pyscipopt import Model as SCIPModel, quicksum
 import pulp
 
 
@@ -99,7 +100,7 @@ class UBPlanner:
         for agent in range(len(self.m_agents)):
             agent_start = time.perf_counter()
 
-            if not self.plan_agent(agent):
+            if not self.plan_agent_quadratic(agent): #self.plan_agent(agent):
                 raise RuntimeError(f"Unable to plan the coverage path for agent: {agent}")
 
             if not self.validate_path(agent):
@@ -239,19 +240,21 @@ class UBPlanner:
         return isclose(p1[0], p2[0], abs_tol=eps) and isclose(p1[1], p2[1], abs_tol=eps)
 
     @staticmethod
-    def _proper_segments_intersect(a1: Point2D, a2: Point2D, b1: Point2D, b2: Point2D, eps: float = 1e-9) -> bool:
+    def _proper_segments_intersect(a1: Point2D,a2: Point2D,b1: Point2D,b2: Point2D,eps: float = 1e-9) -> bool:
         if not UBPlanner._segments_intersect(a1, a2, b1, b2, eps):
             return False
 
-        shared_endpoint = (
-            UBPlanner._same_point(a1, b1, eps)
-            or UBPlanner._same_point(a1, b2, eps)
-            or UBPlanner._same_point(a2, b1, eps)
-            or UBPlanner._same_point(a2, b2, eps)
-        )
-        if shared_endpoint:
+        # Wenn irgendein Endpunkt auf dem jeweils anderen Segment liegt,
+        # dann ist das nur Berührung/Randkontakt und soll erlaubt sein.
+        if (
+            UBPlanner._point_on_segment(a1, b1, b2, eps)
+            or UBPlanner._point_on_segment(a2, b1, b2, eps)
+            or UBPlanner._point_on_segment(b1, a1, a2, eps)
+            or UBPlanner._point_on_segment(b2, a1, a2, eps)
+        ):
             return False
 
+        # Nur echter Kreuzungsschnitt im Inneren beider Segmente ist verboten
         return True
 
     @staticmethod
@@ -577,6 +580,185 @@ class UBPlanner:
                 if i == j:
                     continue
                 val = pulp.value(x[(i, j)])
+                if val is not None and val > 0.5:
+                    successor_global = local_to_global[j]
+                    break
+
+            if successor_global is None:
+                return False
+
+            updated_pairs.append((local_to_global[i], successor_global))
+
+        self.m_agent_paths[agent] = updated_pairs
+        return True
+    
+
+    def plan_agent_quadratic(self, agent: int) -> bool:
+        """
+        Quadratische SCIP-Version von Subproblem 2 (MEPP) via Epigraph-Reformulierung.
+
+        SCIP/PySCIPOpt unterstützt keine nichtlinearen Objectives direkt.
+        Daher modellieren wir:
+
+            min z
+            s.t. z >= lambda * sum(d_ij x_ij) + gamma * sum(q_ijk x_ij x_jk)
+
+        Das ist äquivalent zum ursprünglichen Minimierungsproblem.
+        """
+        if agent < 0 or agent >= len(self.m_agent_paths):
+            raise IndexError("Invalid agent index.")
+
+        local_pairs = self.m_agent_paths[agent]
+        n = len(local_pairs)
+
+        if n == 0:
+            return False
+
+        if n == 1:
+            node_idx = local_pairs[0][0]
+            self.m_depots[agent] = node_idx
+            self.m_agent_paths[agent][0] = (node_idx, node_idx)
+            print("Minimume Cost = 0.0")
+            return True
+
+        local_to_global = [pair[0] for pair in local_pairs]
+        depot_global = self.m_depots[agent]
+
+        max_dist = 1.5 * self.m_res
+
+        dist_node_node: List[List[float]] = [[0.0] * n for _ in range(n)]
+        turn_node_node_node: List[List[List[float]]] = [[[0.0] * n for _ in range(n)] for _ in range(n)]
+
+        # Distanzmatrix
+        for i in range(n):
+            for j in range(n):
+                dist = self._distance(
+                    self.m_nodes[local_to_global[i]],
+                    self.m_nodes[local_to_global[j]]
+                )
+                if dist == 0.0 or dist > max_dist:
+                    dist_node_node[i][j] = self.m_kappa
+                else:
+                    dist_node_node[i][j] = self.m_pcn * dist
+
+        # Turnmatrix
+        for i in range(n):
+            for j in range(n):
+                for k in range(n):
+                    if (
+                        dist_node_node[i][j] > self.m_pcn * max_dist
+                        or dist_node_node[j][k] > self.m_pcn * max_dist
+                    ):
+                        turn_node_node_node[i][j][k] = self.m_kappa
+                    else:
+                        turn = self._turn_angle(
+                            self.m_nodes[local_to_global[i]],
+                            self.m_nodes[local_to_global[j]],
+                            self.m_nodes[local_to_global[k]],
+                        )
+                        turn_node_node_node[i][j][k] = self.m_pcn * turn
+
+        model = SCIPModel(f"plan_agent_quadratic_{agent}")
+
+        # Solver-Parameter
+        model.hideOutput()   # zum Debuggen auskommentieren
+        if self.m_limit < 1e15:
+            model.setRealParam("limits/time", float(self.m_limit))
+        if self.m_gap is not None:
+            model.setRealParam("limits/gap", float(self.m_gap))
+
+        # Binärvariablen x_ij
+        x = {}
+        for i in range(n):
+            for j in range(n):
+                if i == j:
+                    continue
+                x[(i, j)] = model.addVar(vtype="B", name=f"x_{i}_{j}")
+
+        # MTZ-Variablen
+        u = {}
+        for i in range(n):
+            u[i] = model.addVar(vtype="C", lb=0.0, name=f"u_{i}")
+
+        # Epigraph-Variable für die Objective
+        z_obj = model.addVar(vtype="C", lb=0.0, name="z_obj")
+
+        # Linearer Distanzterm
+        total_dist = quicksum(
+            dist_node_node[i][j] * x[(i, j)]
+            for i in range(n)
+            for j in range(n)
+            if i != j
+        )
+
+        # Quadratischer Turnterm
+        total_turn = quicksum(
+            turn_node_node_node[i][j][k] * x[(i, j)] * x[(j, k)]
+            for i in range(n)
+            for j in range(n)
+            if i != j and local_to_global[j] != depot_global
+            for k in range(n)
+            if k != j and (j, k) in x
+        )
+
+        nl_obj_expr = self.m_lambda * total_dist + self.m_gamma * total_turn
+
+        # Epigraph-Constraint statt nonlinear objective
+        model.addCons(z_obj >= nl_obj_expr, name="epigraph_obj")
+
+        # Jetzt lineares Objective
+        model.setObjective(z_obj, "minimize")
+
+        # Genau ein Eingang pro Knoten
+        for j in range(n):
+            model.addCons(
+                quicksum(x[(i, j)] for i in range(n) if i != j) == 1,
+                name=f"flow_in_{j}"
+            )
+
+        # Genau ein Ausgang pro Knoten
+        for i in range(n):
+            model.addCons(
+                quicksum(x[(i, j)] for j in range(n) if j != i) == 1,
+                name=f"flow_out_{i}"
+            )
+
+        # MTZ-Constraints
+        for i in range(n):
+            if local_to_global[i] == depot_global:
+                continue
+            for j in range(n):
+                if local_to_global[j] == depot_global or j == i:
+                    continue
+                model.addCons(
+                    u[i] - u[j] + n * x[(i, j)] <= n - 1,
+                    name=f"mtz_{i}_{j}"
+                )
+
+        model.optimize()
+
+        status = model.getStatus()
+        if status not in {"optimal", "timelimit", "gaplimit", "bestsollimit"}:
+            print(f"SCIP status: {status}")
+            return False
+
+        try:
+            obj_val = model.getVal(z_obj)
+        except Exception:
+            return False
+
+        if obj_val is None or (obj_val / self.m_pcn) >= self.m_kappa:
+            return False
+
+        print(f"Minimume Cost = {obj_val / self.m_pcn}")
+
+        updated_pairs: List[Tuple[int, int]] = []
+        for i in range(n):
+            successor_global: Optional[int] = None
+            for j in range(n):
+                if i == j:
+                    continue
+                val = model.getVal(x[(i, j)])
                 if val is not None and val > 0.5:
                     successor_global = local_to_global[j]
                     break
