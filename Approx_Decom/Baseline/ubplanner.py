@@ -5,7 +5,7 @@ from math import ceil, sqrt, acos, pi, isclose
 from typing import List, Optional, Tuple
 import json
 import time
-
+ 
 from pyscipopt import Model as SCIPModel, quicksum
 import pulp
 
@@ -30,7 +30,7 @@ class UBPlanner:
         self.m_lambda: float = 1.0
         self.m_gamma: float = 1.0
         self.m_kappa: float = 1_000_000_000.0
-        self.m_pcn: float = 100.0
+        self.m_pcn: float = 1.0
 
         self.m_depots: List[int] = []
         self.m_areas: List[List[Point2D]] = []
@@ -39,9 +39,6 @@ class UBPlanner:
 
         # Pro Agent: Liste von (node_index, successor_index)
         self.m_agent_paths: List[List[Tuple[int, int]]] = []
-
-        # Optional: exaktes Nachbilden der kleinen C++-Eigenheit in divide()
-        self.mimic_cpp_depot_bug: bool = False
 
     # ------------------------------------------------------------------
     # Setter
@@ -221,41 +218,20 @@ class UBPlanner:
         o3 = UBPlanner._orientation(b1, b2, a1, eps)
         o4 = UBPlanner._orientation(b1, b2, a2, eps)
 
-        if o1 != o2 and o3 != o4:
-            return True
-
-        if o1 == 0 and UBPlanner._point_on_segment(b1, a1, a2, eps):
-            return True
-        if o2 == 0 and UBPlanner._point_on_segment(b2, a1, a2, eps):
-            return True
-        if o3 == 0 and UBPlanner._point_on_segment(a1, b1, b2, eps):
-            return True
-        if o4 == 0 and UBPlanner._point_on_segment(a2, b1, b2, eps):
-            return True
-
-        return False
+        # 2. Bedingung für echte Kreuzung:
+        # - Alle Orientierungen müssen NICHT 0 sein (keine Kollinearität/Überlappung/Endpunkt-Berührung)
+        # - Die Punkte von B müssen auf unterschiedlichen Seiten von A liegen (o1 != o2)
+        # - Die Punkte von A müssen auf unterschiedlichen Seiten von B liegen (o3 != o4)
+        
+        if o1 == 0 or o2 == 0 or o3 == 0 or o4 == 0:
+            return False  # Sofort False bei jeglicher Kollinearität oder Berührung
+            
+        return (o1 != o2) and (o3 != o4)
 
     @staticmethod
     def _same_point(p1: Point2D, p2: Point2D, eps: float = 1e-9) -> bool:
         return isclose(p1[0], p2[0], abs_tol=eps) and isclose(p1[1], p2[1], abs_tol=eps)
 
-    @staticmethod
-    def _proper_segments_intersect(a1: Point2D,a2: Point2D,b1: Point2D,b2: Point2D,eps: float = 1e-9) -> bool:
-        if not UBPlanner._segments_intersect(a1, a2, b1, b2, eps):
-            return False
-
-        # Wenn irgendein Endpunkt auf dem jeweils anderen Segment liegt,
-        # dann ist das nur Berührung/Randkontakt und soll erlaubt sein.
-        if (
-            UBPlanner._point_on_segment(a1, b1, b2, eps)
-            or UBPlanner._point_on_segment(a2, b1, b2, eps)
-            or UBPlanner._point_on_segment(b1, a1, a2, eps)
-            or UBPlanner._point_on_segment(b2, a1, a2, eps)
-        ):
-            return False
-
-        # Nur echter Kreuzungsschnitt im Inneren beider Segmente ist verboten
-        return True
 
     @staticmethod
     def _turn_angle(i: Point2D, j: Point2D, k: Point2D) -> float:
@@ -339,7 +315,7 @@ class UBPlanner:
                 for k in range(len(area) - 1):
                     b1 = area[k]
                     b2 = area[k + 1]
-                    if self._proper_segments_intersect(a1, a2, b1, b2):
+                    if self._segments_intersect(a1, a2, b1, b2):
                         return False
 
         return True
@@ -404,34 +380,23 @@ class UBPlanner:
 
         self.m_agent_paths = [[] for _ in range(num_agents)]
 
-        if self.mimic_cpp_depot_bug:
-            min_dist_global = self.m_kappa
-            for a in range(num_agents):
-                for i in range(num_nodes):
-                    val = pulp.value(x[(a, i)])
-                    if val is not None and val > 0.5:
-                        self.m_agent_paths[a].append((i, i))
-                        dist = self._distance(self.m_agents[a], self.m_nodes[i])
-                        if dist < min_dist_global:
-                            min_dist_global = dist
-                            self.m_depots[a] = i
-        else:
-            for a in range(num_agents):
-                min_dist = self.m_kappa
-                for i in range(num_nodes):
-                    val = pulp.value(x[(a, i)])
-                    if val is not None and val > 0.5:
-                        self.m_agent_paths[a].append((i, i))
-                        dist = self._distance(self.m_agents[a], self.m_nodes[i])
-                        if dist < min_dist:
-                            min_dist = dist
-                            self.m_depots[a] = i
+        for a in range(num_agents):
+            min_dist = self.m_kappa
+            for i in range(num_nodes):
+                val = pulp.value(x[(a, i)])
+                if val is not None and val > 0.5:
+                    self.m_agent_paths[a].append((i, i))
+                    dist = self._distance(self.m_agents[a], self.m_nodes[i])
+                    if dist < min_dist:
+                        min_dist = dist
+                        self.m_depots[a] = i
 
         return True
 
     # ------------------------------------------------------------------
     # plan_agent  (linearisiert)
     # ------------------------------------------------------------------
+    """"
     def plan_agent(self, agent: int) -> bool:
         if agent < 0 or agent >= len(self.m_agent_paths):
             raise IndexError("Invalid agent index.")
@@ -591,7 +556,7 @@ class UBPlanner:
 
         self.m_agent_paths[agent] = updated_pairs
         return True
-    
+    """
 
     def plan_agent_quadratic(self, agent: int) -> bool:
         """
@@ -698,7 +663,7 @@ class UBPlanner:
             for j in range(n)
             if i != j and local_to_global[j] != depot_global
             for k in range(n)
-            if k != j and (j, k) in x
+            if k != j #and (j, k) in x
         )
 
         nl_obj_expr = self.m_lambda * total_dist + self.m_gamma * total_turn

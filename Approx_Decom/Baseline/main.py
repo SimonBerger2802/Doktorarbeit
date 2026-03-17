@@ -63,7 +63,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "-p", "--precision",
         type=float,
-        default=100.0,
+        default=1.0,
         help="Set precision for capacity calculation."
     )
 
